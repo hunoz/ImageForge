@@ -1,0 +1,14 @@
+{
+    "version": "1.0",
+    "projections": {
+        "source": {
+            "plugins": {
+                "java-server-codegen": {
+                    "service": "dev.popaxe.imageforge#UserApi",
+                    "namespace": "dev.popaxe.imageforge.generated",
+                    "protocol": "aws.protocols#restJson1"
+                }
+            }
+        }
+    }
+}

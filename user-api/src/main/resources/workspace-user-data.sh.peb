@@ -1,0 +1,112 @@
+{# @pebvariable name="hostname" type="String" #}
+{# @pebvariable name="username" type="String" #}
+{# @pebvariable name="languageRuntimes" type="List<Map<String, String>>" #}
+{# @pebvariable name="packagesToInstall" type="List<String>" #}
+Content-Type: multipart/mixed; boundary="//"
+MIME-Version: 1.0
+
+--//
+Content-Disposition: attachment; filename="cloud-config.yaml"
+Content-Transfer-Encoding: 7bit
+Content-Type: text/cloud-config
+Mime-Version: 1.0
+
+#cloud-config
+cloud_final_modules:
+  - [scripts-user, always]
+hostname: {{ hostname }}
+users:
+  - name: {{ username }}
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    lock_passwd: true
+    homedir: /home/{{ username }}
+
+--//
+Content-Disposition: attachment; filename="userdata.sh"
+Content-Transfer-Encoding: 7bit
+Content-Type: text/x-shellscript
+Mime-Version: 1.0
+
+#!/usr/bin/env bash
+set -ex
+
+sudo yum install -y zsh git util-linux-user
+
+DEFAULT_USER='{{ username }}'
+
+MOUNT_POINT="/workspace"
+DEVICE_NAME='/dev/sdb'
+
+# This will wait up to 5 minutes (adjust as needed)
+for i in {1..60}; do
+  id $DEFAULT_USER &>/dev/null && break
+  echo "Waiting for $DEFAULT_USER to be created..."
+  sleep 5
+done
+
+if ! id $DEFAULT_USER; then
+  echo "$DEFAULT_USER does not exist, exiting..."
+  exit 1
+fi
+
+sudo mkdir -p /home/$DEFAULT_USER
+sudo chown -R $DEFAULT_USER:$DEFAULT_USER /home/$DEFAULT_USER
+
+# Workspace setup
+sudo -u "$DEFAULT_USER" sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh) --unattended"
+sudo -u "$DEFAULT_USER" sh -c 'curl https://mise.run | sh'
+echo "eval \"\$(/home/$DEFAULT_USER/.local/bin/mise activate zsh)\"" >> /home/$DEFAULT_USER/.zshrc
+# Swap for gnupg2-full for full gpg support, which is required for mise to function
+sudo dnf swap -y gnupg2-minimal gnupg2-full
+sudo -k chsh -s $(which zsh) "$DEFAULT_USER"
+sudo mkdir -p $MOUNT_POINT
+sudo chown -R $DEFAULT_USER:$DEFAULT_USER $MOUNT_POINT
+sudo -u "$DEFAULT_USER" sh -c "ln -s $MOUNT_POINT /home/$DEFAULT_USER/workspace"
+
+# Attach EBS volume
+## Wait for the device to show up
+for i in {1..10}; do
+  if [ -e "$DEVICE_NAME" ]; then
+    break
+  fi
+  sleep 3
+done
+
+if ! [ -e "$DEVICE_NAME" ]; then
+    echo "$DEVICE_NAME not found"
+    exit 1
+fi
+
+# Format the volume if needed
+SYMBOLIC_DEVICE_NAME=$(file -s $DEVICE_NAME | awk '{ print $5 }')
+if ! file -s "/dev/${SYMBOLIC_DEVICE_NAME}" | grep -q ext4; then
+  mkfs -t ext4 "$DEVICE_NAME"
+else
+  echo "Filesystem already exists"
+fi
+
+# Create mount point and mount
+mkdir -p "$MOUNT_POINT"
+mount "$DEVICE_NAME" "$MOUNT_POINT"
+sudo chown -R $DEFAULT_USER:$DEFAULT_USER $MOUNT_POINT
+
+# Persist in fstab
+UUID=$(blkid -s UUID -o value "$DEVICE_NAME")
+echo "UUID=$UUID $MOUNT_POINT ext4 defaults,nofail 0 2" >> /etc/fstab
+
+# Configure and restart sshd
+cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak
+echo -e "\n Match User $DEFAULT_USER\n    PermitEmptyPasswords yes\n    PasswordAuthentication yes" | tee -a /etc/ssh/sshd_config
+passwd -d $DEFAULT_USER
+systemctl restart sshd
+
+# Install language runtimes
+{% for runtime in languageRuntimes %}
+    sudo -u "$DEFAULT_USER" sh -c 'mise install {{  runtime["language"] }}@{{ runtime["version"] }}'
+{% endfor %}
+
+{% for package in packagesToInstall %}
+    yum install -y {{  package }}
+{% endfor %}
+--//--
